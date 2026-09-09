@@ -45,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     OFFLOAD_V_CACHE_NPU_INDEX,
 )
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
+from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.quantization.methods import (
     AscendW8A8DynamicLinearMethod,
@@ -1127,7 +1128,17 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         kw, _ = self.wk_weights_proj(x)
         k_li = kw[:, : self.head_dim]
-        k_li = self.k_norm(k_li).unsqueeze(1)
+        k_norm = self.k_norm
+        if HAS_TRITON and getattr(k_norm, "bias", None) is not None:
+            # vllm's LayerNorm.forward upcasts the bf16 input to fp32, runs
+            # F.layer_norm in fp32 and casts back: two Cast kernels plus an
+            # fp32 LayerNormV3 right in front of the rope kernel. The triton
+            # layer-norm computes the same fp32 math in one kernel and stores
+            # straight back to bf16.
+            k_li = layer_norm_fwd_npu(k_li, k_norm.weight, k_norm.bias, k_norm.eps)[0]
+        else:
+            k_li = k_norm(k_li)
+        k_li = k_li.unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
 
         if HAS_TRITON:

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.nn.functional as F
 from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -447,6 +448,68 @@ class TestAscendSFAKVQuantSparseAttention(TestBase):
         self.assertEqual(call_kwargs["kv_cache_quant_mode"], 3)
         self.assertEqual(call_kwargs["ckvkr_repo_mode"], 1)
         self.assertEqual(call_kwargs["quant_scale_repo_mode"], 1)
+
+
+class TestAscendSFAIndexerKNorm(TestBase):
+    """Indexer k_norm: fused triton layernorm replaces the fp32 round-trip."""
+
+    def _make_impl(self, k_norm, num_tokens=4, head_dim=128, weights_dim=32):
+        kw = torch.randn(num_tokens, head_dim + weights_dim)
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.layer_name = "model.layers.0"
+        impl.has_indexer = True
+        impl.wk_weights_proj = MagicMock(return_value=(kw, None))
+        impl.k_norm = k_norm
+        impl.head_dim = head_dim
+        impl.qk_rope_head_dim = 64
+        impl.is_rope_neox_style = False
+        impl.enable_sparse_li_c8 = False
+        self.kw = kw
+        return impl
+
+    @patch("vllm_ascend.attention.sfa_v1.DeviceOperator.indexer_select_post_process")
+    @patch("vllm_ascend.attention.sfa_v1.HAS_TRITON", True)
+    @patch("vllm_ascend.attention.sfa_v1.rope_forward_triton_siso", side_effect=lambda x, *a, **k: x)
+    @patch("vllm_ascend.attention.sfa_v1.layer_norm_fwd_npu")
+    def test_k_norm_uses_fused_triton_layernorm(self, mock_ln, mock_rope, mock_devop):
+        weight = torch.randn(128)
+        bias = torch.randn(128)
+        k_norm = SimpleNamespace(weight=weight, bias=bias, eps=1e-6)
+        impl = self._make_impl(k_norm)
+        normed = torch.randn(4, 128)
+        mock_ln.return_value = (normed, None, None)
+
+        k_li, _ = impl.indexer_select_pre_process(
+            x=torch.randn(4, 160),
+            cos=torch.randn(4, 1, 1, 64),
+            sin=torch.randn(4, 1, 1, 64),
+        )
+
+        mock_ln.assert_called_once()
+        call_args = mock_ln.call_args
+        self.assertTrue(torch.equal(call_args.args[0], self.kw[:, :128]))
+        self.assertIs(call_args.args[1], weight)
+        self.assertIs(call_args.args[2], bias)
+        self.assertEqual(call_args.args[3], 1e-6)
+        # The roped k flows straight from the fused layernorm output.
+        self.assertTrue(torch.equal(k_li.view(-1, 128), normed))
+
+    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_rotary_mul", create=True)
+    @patch("vllm_ascend.attention.sfa_v1.HAS_TRITON", False)
+    def test_k_norm_falls_back_to_module_call_without_triton(self, mock_rotary):
+        mock_rotary.side_effect = lambda x, cos, sin: x
+        k_norm = MagicMock(side_effect=lambda x: F.layer_norm(x.float(), (x.shape[-1],), None, None, 1e-6).type_as(x))
+        impl = self._make_impl(k_norm)
+
+        k_li, _ = impl.indexer_select_pre_process(
+            x=torch.randn(4, 160),
+            cos=torch.randn(4, 1, 1, 64),
+            sin=torch.randn(4, 1, 1, 64),
+        )
+
+        k_norm.assert_called_once()
+        expected = F.layer_norm(self.kw[:, :128].float(), (128,), None, None, 1e-6).type_as(self.kw)
+        self.assertTrue(torch.allclose(k_li.view(-1, 128), expected, atol=1e-5))
 
 
 class TestAscendSFAMetadata(TestBase):

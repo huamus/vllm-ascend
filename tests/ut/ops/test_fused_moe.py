@@ -498,6 +498,34 @@ def test_local_shared_expert_dp_reduces_partial_routed_output(
         all_reduce.assert_not_called()
 
 
+def test_compute_router_logits_bf16_gemm_matches_fp32_reference():
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    hidden = torch.randn(6, 16, dtype=torch.bfloat16)
+    gate = SimpleNamespace(weight=torch.randn(8, 16, dtype=torch.bfloat16))
+
+    logits = runner._compute_router_logits(gate, hidden)
+
+    # A bf16 GEMM with fp32 accumulation matches an fp32 GEMM on bf16-origin
+    # data, and only the [tokens, num_experts] logits are cast to fp32.
+    reference = F.linear(hidden.float(), gate.weight.float())
+    assert logits.dtype == torch.float32
+    assert logits.shape == (6, 8)
+    torch.testing.assert_close(logits, reference, rtol=1e-2, atol=1e-2)
+
+
+def test_compute_router_logits_precast_fp32_weight_keeps_fp32_gemm():
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    hidden = torch.randn(6, 16, dtype=torch.bfloat16)
+    weight_fp32 = torch.randn(8, 16, dtype=torch.float32)
+    gate = SimpleNamespace(weight=torch.randn(8, 16, dtype=torch.bfloat16), weight_fp32=weight_fp32)
+
+    logits = runner._compute_router_logits(gate, hidden)
+
+    reference = F.linear(hidden.float(), weight_fp32)
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, reference)
+
+
 def test_routed_experts_select_experts_validates_router_logits(monkeypatch):
     routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
     hidden_states = torch.randn(2, 4)

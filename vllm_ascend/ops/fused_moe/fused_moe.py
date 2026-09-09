@@ -108,6 +108,25 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             # The runner must recompute router_logits via the gate.
             return self.gate is not None
 
+    def _compute_router_logits(self, gate: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the internal router gate and return fp32 router logits.
+
+        Gates that pre-cast an fp32 weight (``weight_fp32``, e.g. DSv4) keep
+        the explicit fp32 GEMM. For other gates, run the GEMM in the
+        activation dtype and cast only the [tokens, num_experts] logits to
+        fp32: a bf16 GEMM with fp32 accumulation is numerically equivalent to
+        an fp32 GEMM on bf16-origin data, while the old path copied the whole
+        [tokens, hidden] activation to fp32 (and re-cast the weight) on every
+        layer.
+        """
+        if hasattr(gate, "weight_fp32"):
+            # NOTE(Angazenn): To make this cast explicitly, the hbm usage might
+            # increase with extra hidden states. We also assume that all gate
+            # linear is unquantized so that we the weight is pre-casted in
+            # process_weights_after_loading of AscendUnquantizedLinearMethod.
+            return F.linear(hidden_states.float(), gate.weight_fp32)
+        return F.linear(hidden_states, gate.weight).float()
+
     @property
     def use_dp_chunking(self) -> bool:
         """Ascend uses its own forward_impl path, not the FlashInfer Cutlass
@@ -236,14 +255,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 if self.is_internal_router:
                     gate = self.gate
                     assert gate is not None
-                    # NOTE(Angazenn): To make this cast explicitly, the hbm usage might
-                    # increase with extra hidden states. We also assume that all gate
-                    # linear is unquantized so that we the weight is pre-casted in
-                    # process_weights_after_loading of AscendUnquantizedLinearMethod.
-                    hidden_states_fp32 = shared_hidden_states.float()
                     before_routed_experts = torch.npu.current_stream().record_event()
-                    # v0.27.1: weight_fp32 is guaranteed by is_internal_router.
-                    router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
+                    # v0.27.1: weight_fp32 is guaranteed by is_internal_router,
+                    # so _compute_router_logits keeps the explicit fp32 GEMM.
+                    router_logits = self._compute_router_logits(gate, shared_hidden_states)
                     after_routed_experts = torch.npu.current_stream().record_event()
                 else:
                     before_routed_experts = torch.npu.current_stream().record_event()
@@ -283,11 +298,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     if self.is_internal_router:
                         gate = self.gate
                         assert gate is not None
-                        hidden_states_fp32 = hidden_states.float()
-                        router_logits = F.linear(
-                            hidden_states_fp32,
-                            gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32),
-                        )
+                        router_logits = self._compute_router_logits(gate, hidden_states)
                     return self.routed_experts.forward_impl(
                         hidden_states=hidden_states,
                         router_logits=router_logits,
@@ -299,18 +310,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 if self.is_internal_router:
                     gate = self.gate
                     assert gate is not None
-                    # NOTE(Angazenn): To make this cast explicitly, the hbm usage might
-                    # increase with extra hidden states. We also assume that all gate
-                    # linear is unquantized so that we the weight is pre-casted in
-                    # process_weights_after_loading of AscendUnquantizedLinearMethod.
-                    hidden_states_fp32 = shared_hidden_states.float()
                     before_routed_experts = torch.npu.current_stream().record_event()
-                    # main (cdc4824a21): is_internal_router only checks self.gate,
-                    # weight_fp32 may be absent, fall back to gate.weight.
-                    router_logits = F.linear(
-                        hidden_states_fp32,
-                        gate.weight_fp32 if hasattr(gate, "weight_fp32") else gate.weight.to(torch.float32),
-                    )
+                    router_logits = self._compute_router_logits(gate, shared_hidden_states)
                     after_routed_experts = torch.npu.current_stream().record_event()
                 else:
                     before_routed_experts = torch.npu.current_stream().record_event()
